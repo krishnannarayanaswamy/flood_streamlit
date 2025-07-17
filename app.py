@@ -108,13 +108,12 @@ with tab3:
                     folium.LayerControl().add_to(m)
 
                 st.success("Analysis complete!")
-
-                # Create columns for the map and the results
+                
                 map_col, results_col = st.columns([2, 1])
 
                 with map_col:
                     st_folium(m, width=700, height=500)
-
+                
                 with results_col:
                     st.subheader("Analysis Results")
                     st.error(
@@ -153,7 +152,7 @@ with tab1:
         - Recommendation for the best clothing
         - General FAQs
         """)
-
+        
     FLOW_URL = f"http://localhost:7860/api/v1/run/customer-support2"
     TWEAKS = {}
 
@@ -170,7 +169,7 @@ with tab1:
             raise Exception(f"Error making API request: {e}")
         except ValueError as e:
             raise Exception(f"Error parsing response: {e}")
-
+            
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
@@ -205,6 +204,23 @@ with tab1:
 
 # --- Tab 2: Route Planner Agent ---
 with tab2:
+    # --- Caching Functions for API Calls ---
+    @st.cache_data
+    def get_distance_matrix(coords):
+        client = openrouteservice.Client(key=st.secrets["ORS_API_KEY"])
+        matrix = client.distance_matrix(
+            locations=coords, profile='driving-car', metrics=['distance'], units='km')
+        return (np.array(matrix["distances"]) * 1000).astype(int)
+
+    @st.cache_data
+    def get_directions(route_coords):
+        client = openrouteservice.Client(key=st.secrets["ORS_API_KEY"])
+        return client.directions(
+            coordinates=route_coords,
+            profile='driving-car',
+            format='geojson'
+        )
+
     st.subheader("Step 1: Select number of vehicles")
     num_vehicles = st.number_input(
         "How many vehicles will be used for delivery?", min_value=1, max_value=10, value=2, step=1)
@@ -223,35 +239,32 @@ with tab2:
     st.markdown(
         "Tick the boxes for the delivery points you want to include in the route:")
     sorted_market_labels = sorted(df_markets["Label"].unique())
-
+    
     selected_market_labels = []
     cols = st.columns(3)
     for i, label in enumerate(sorted_market_labels):
         if cols[i % 3].checkbox(label, key=f"market_{label}"):
             selected_market_labels.append(label)
 
-    if not selected_market_labels:
-        st.warning("Please select at least one market to continue.")
-        st.stop()
+    delivery_locations = list(selected_market_labels)
+    if depot_label in delivery_locations:
+        delivery_locations.remove(depot_label)
 
-    if depot_label in selected_market_labels:
-        selected_market_labels.remove(depot_label)
+    if not delivery_locations:
+        st.warning("Please select at least one delivery market that is not the depot.")
+        st.stop()
 
     depot_df = df_markets[df_markets["Label"] == depot_label]
     markets_df = df_markets[df_markets["Label"].isin(
-        selected_market_labels)]
+        delivery_locations)]
     selected_markets = pd.concat([depot_df, markets_df]).drop_duplicates(
         subset="Label").reset_index(drop=True)
     selected_markets.loc[0, "Label"] = "📦 DEPO"
-
-    ORS_API_KEY = st.secrets["ORS_API_KEY"]
-    client = openrouteservice.Client(key=ORS_API_KEY)
-    coordinates = selected_markets[[
-        "Longitude", "Latitude"]].values.tolist()
-
-    matrix = client.distance_matrix(
-        locations=coordinates, profile='driving-car', metrics=['distance'], units='km')
-    distance_matrix = (np.array(matrix["distances"]) * 1000).astype(int)
+    
+    matrix_coords = selected_markets[["Longitude", "Latitude"]].values.tolist()
+    
+    # Use the cached function to get the distance matrix
+    distance_matrix = get_distance_matrix(tuple(map(tuple, matrix_coords)))
 
     data = {"distance_matrix": distance_matrix.tolist(
     ), "num_vehicles": num_vehicles, "depot": 0}
@@ -287,34 +300,51 @@ with tab2:
                                 selected_markets.iloc[0]["Latitude"], selected_markets.iloc[0]["Longitude"]], zoom_start=11)
         colors = ["red", "blue", "green", "purple", "orange",
                   "darkred", "cadetblue", "darkgreen", "black", "pink"]
+        
         marker_cluster = MarkerCluster().add_to(map_routes)
 
         for vehicle_id in range(data["num_vehicles"]):
             index = routing.Start(vehicle_id)
-            route, route_coords, route_labels, route_distance = [], [], [], 0
+            route_display, route_coords_for_api, route_distance = [], [], 0
+            
             while not routing.IsEnd(index):
                 node_index = manager.IndexToNode(index)
-                route.append(selected_markets.loc[node_index, "Label"])
-                route_coords.append(
-                    (selected_markets.loc[node_index, "Latitude"], selected_markets.loc[node_index, "Longitude"]))
-                route_labels.append(
-                    selected_markets.loc[node_index, "Label"])
+                route_display.append(selected_markets.loc[node_index, "Label"])
+                route_coords_for_api.append(tuple(matrix_coords[node_index]))
                 previous_index = index
                 index = solution.Value(routing.NextVar(index))
                 route_distance += routing.GetArcCostForVehicle(
                     previous_index, index, vehicle_id)
+            
+            final_node_index = manager.IndexToNode(index)
+            route_coords_for_api.append(tuple(matrix_coords[final_node_index]))
+            
+            if len(route_coords_for_api) > 1:
+                # Use the cached function to get directions
+                directions = get_directions(tuple(route_coords_for_api))
+                folium.GeoJson(
+                    directions,
+                    style_function=lambda x, color=colors[vehicle_id % len(colors)]: {
+                        'color': color,
+                        'weight': 5,
+                        'opacity': 0.7
+                    },
+                    tooltip=f"Vehicle {vehicle_id + 1}"
+                ).add_to(map_routes)
 
-            route.append("📦 DEPO")
             st.markdown(f"### 🚛 Vehicle {vehicle_id + 1} Route:")
-            st.write(" → ".join(route))
+            st.write(" → ".join(route_display) + " → 📦 DEPO")
             st.write(f"🛣️ Distance: {route_distance / 1000:.2f} km")
             total_distance += route_distance
-
-            folium.PolyLine(route_coords, color=colors[vehicle_id % len(
-                colors)], weight=5, opacity=0.7, tooltip=f"Vehicle {vehicle_id + 1}").add_to(map_routes)
-            for i, (coord, label) in enumerate(zip(route_coords, route_labels)):
-                folium.Marker(location=coord, popup=f"Vehicle {vehicle_id + 1} - Step {i + 1}: {label}", icon=folium.Icon(
-                    color=colors[vehicle_id % len(colors)])).add_to(marker_cluster)
+            
+            for i, label in enumerate(route_display):
+                 coord = (selected_markets[selected_markets['Label'] == label]['Latitude'].iloc[0],
+                          selected_markets[selected_markets['Label'] == label]['Longitude'].iloc[0])
+                 folium.Marker(
+                     location=coord,
+                     popup=f"Vehicle {vehicle_id + 1} - Stop {i + 1}: {label}",
+                     icon=folium.Icon(color=colors[vehicle_id % len(colors)])
+                 ).add_to(marker_cluster)
 
         st.markdown(
             f"### 📦 Total distance for all vehicles: **{total_distance / 1000:.2f} km**")
