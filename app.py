@@ -72,21 +72,17 @@ def get_flood_overlay_from_langflow_cached(bbox, analysis_date):
     Cached version of Langflow flood detection API call.
     """
     url = "http://localhost:7860/api/v1/run/c496e528-0a6d-4be4-a4a7-f569309e1914"
-    api_key = st.secrets["LANGFLOW_API_KEY"]
+    api_key = st.secrets.get("LANGFLOW_API_KEY", "")  # Use .get for safety
 
     headers = {
         "x-api-key": api_key,
         "Content-Type": "application/json"
     }
 
-    # Create the data structure as expected by your Langflow component
     input_data = {
-        # Convert bbox to comma-separated string
         "bounding_box": ",".join(map(str, bbox)),
-        "analysis_date": analysis_date  # Send the date as an ISO-formatted string
+        "analysis_date": analysis_date
     }
-
-    # The input to your flow should be a JSON string of this data
     input_value_string = json.dumps(input_data)
 
     payload = {
@@ -98,22 +94,31 @@ def get_flood_overlay_from_langflow_cached(bbox, analysis_date):
     try:
         response = requests.post(url, headers=headers, json=payload)
         response.raise_for_status()
-
-        # You will likely need to parse the actual GeoJSON from the response text
         response_data = response.json()
-        if 'outputs' in response_data and response_data['outputs']:
-            # Navigate through the nested structure to get the final message text
-            message_text = response_data['outputs'][0]['outputs'][0]['results']['message']['text']
-            # The text itself is a JSON string, so we need to parse it
-            return json.loads(message_text)
-        else:
-            return None
+
+        outputs = response_data.get('outputs', [{}])[0].get('outputs', [{}])[0]
+        if outputs and 'results' in outputs:
+            message_text = outputs['results'].get('message', {}).get('text')
+            if message_text:
+                # FIX: Check if the response is JSON before parsing. Langflow might return a text error.
+                try:
+                    return json.loads(message_text)
+                except json.JSONDecodeError:
+                    st.warning(
+                        f"Langflow returned a plain text message instead of GeoJSON: '{message_text}'")
+                    return None
+
+        st.warning("Could not find expected data in Langflow response.")
+        st.json(response_data)
+        return None
 
     except requests.exceptions.HTTPError as http_err:
         st.error(f"HTTP error occurred: {http_err}")
+        st.error(f"Response content: {http_err.response.content.decode()}")
         return None
     except json.JSONDecodeError as json_err:
         st.error(f"Failed to parse JSON from Langflow response: {json_err}")
+        st.text(response.text)
         return None
     except Exception as e:
         st.error(f"An unexpected error occurred: {e}")
@@ -131,12 +136,11 @@ def analyze_road_flood_impact(route_coords, flood_data):
 
         for feature in flood_data['features']:
             if feature['geometry']['type'] == 'Polygon':
-                # Simple bounding box check for flood intersection
                 coords = feature['geometry']['coordinates'][0]
-                min_lon = min(p[0] for p in coords)
-                max_lon = max(p[0] for p in coords)
-                min_lat = min(p[1] for p in coords)
-                max_lat = max(p[1] for p in coords)
+                min_lon, max_lon = min(p[0] for p in coords), max(
+                    p[0] for p in coords)
+                min_lat, max_lat = min(p[1] for p in coords), max(
+                    p[1] for p in coords)
 
                 if min_lon <= lon <= max_lon and min_lat <= lat <= max_lat:
                     affected_segments.append({
@@ -145,7 +149,6 @@ def analyze_road_flood_impact(route_coords, flood_data):
                         "flood_area": feature.get('properties', {}).get('name', 'Flood Zone'),
                         "severity": feature.get('properties', {}).get('severity', 'unknown')
                     })
-
     return affected_segments
 
 
@@ -167,7 +170,7 @@ with tab1:
     st.header("📍 Plan Your Delivery Route")
 
     df_locations = pd.DataFrame(LOGISTICS_LOCATIONS, columns=[
-        "Type", "Location", "Latitude", "Longitude"])
+                                "Type", "Location", "Latitude", "Longitude"])
     df_locations["Label"] = df_locations["Type"] + \
         " - " + df_locations["Location"]
 
@@ -177,7 +180,7 @@ with tab1:
             "Select your starting depot:",
             options=df_locations["Label"].unique(),
             index=0,
-            key="depot_selector"  # Added unique key
+            key="depot_selector"
         )
 
     with col2:
@@ -194,24 +197,20 @@ with tab1:
         if cols[i % 3].checkbox(label, key=f"dest_{label}"):
             selected_destinations.append(label)
 
-    if len(selected_destinations) < 1:
+    if not selected_destinations:
         st.warning("Please select at least one delivery destination.")
         st.stop()
 
-    # For better routing results, recommend multiple destinations
     if len(selected_destinations) == 1:
         st.info(
             "💡 Tip: Select multiple destinations for more efficient route optimization!")
 
-    # Build route optimization
     route_locations = [depot_label] + selected_destinations
     selected_df = df_locations[df_locations["Label"].isin(route_locations)]
     selected_df = selected_df.reset_index(drop=True)
     selected_df.loc[0, "Label"] = "🏭 DEPOT"
 
     matrix_coords = selected_df[["Longitude", "Latitude"]].values.tolist()
-
-    # Use cached distance matrix
     distance_matrix = get_distance_matrix(tuple(map(tuple, matrix_coords)))
 
     data = {
@@ -224,26 +223,15 @@ with tab1:
         len(data["distance_matrix"]), data["num_vehicles"], data["depot"])
     routing = pywrapcp.RoutingModel(manager)
 
-    # Add constraints - handle single vs multiple destinations differently
-    if len(selected_destinations) == 1:
-        # For single destination, don't allow skipping - make it mandatory
-        # No disjunction constraints = all nodes must be visited
-        pass
-    else:
-        # For multiple destinations, allow some flexibility with high penalty
-        penalty = 1000000  # Much higher penalty to discourage skipping
+    if len(selected_destinations) > 1:
+        penalty = 1000000
         for node in range(1, len(data["distance_matrix"])):
             routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
 
-    # Simplified capacity constraints
     demands = [0] + [1] * (len(data["distance_matrix"]) - 1)
-
-    # For single destination, ensure vehicle can handle it
     if len(selected_destinations) == 1:
-        # Can handle all deliveries
         vehicle_capacities = [len(demands)] * data["num_vehicles"]
     else:
-        # Distribute deliveries across vehicles
         total_demand = sum(demands)
         vehicle_capacity = max(total_demand // data["num_vehicles"] + 1, 1)
         vehicle_capacities = [vehicle_capacity] * data["num_vehicles"]
@@ -254,18 +242,19 @@ with tab1:
         demand_callback_index, 0, vehicle_capacities, True, 'Capacity')
 
     transit_callback_index = routing.RegisterTransitCallback(
-        lambda from_index, to_index: data["distance_matrix"][manager.IndexToNode(from_index)][manager.IndexToNode(to_index)])
+        lambda from_index, to_index: data["distance_matrix"][manager.IndexToNode(
+            from_index)][manager.IndexToNode(to_index)]
+    )
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
-    search_parameters.time_limit.seconds = 30  # Add time limit
+    search_parameters.time_limit.seconds = 30
     solution = routing.SolveWithParameters(search_parameters)
 
     st.subheader("🚛 Optimized Delivery Routes")
     if solution:
-        # Create map
         route_map = folium.Map(
             location=[selected_df.iloc[0]["Latitude"],
                       selected_df.iloc[0]["Longitude"]],
@@ -274,11 +263,7 @@ with tab1:
         colors = ["red", "blue", "green", "purple", "orange"]
         marker_cluster = MarkerCluster().add_to(route_map)
         total_distance = 0
-
-        # Store route data for disaster analysis
-        if "route_data" not in st.session_state:
-            st.session_state.route_data = {}
-        st.session_state.route_data = {}
+        new_route_data = {}
 
         for vehicle_id in range(data["num_vehicles"]):
             index = routing.Start(vehicle_id)
@@ -296,229 +281,187 @@ with tab1:
             final_node_index = manager.IndexToNode(index)
             route_coords.append(tuple(matrix_coords[final_node_index]))
 
-            # Store route for disaster analysis
-            st.session_state.route_data[f"vehicle_{vehicle_id}"] = {
-                "coords": route_coords,
-                "display": route_display,
-                "distance": route_distance
-            }
-
-            if len(route_coords) > 1:
-                # Use cached directions
+            if len(route_coords) > 2:
+                new_route_data[f"vehicle_{vehicle_id}"] = {
+                    "coords": route_coords,
+                    "display": route_display,
+                    "distance": route_distance
+                }
                 directions = get_directions(tuple(route_coords))
                 folium.GeoJson(
                     directions,
-                    style_function=lambda x, color=colors[vehicle_id % len(colors)]: {
+                    style_function=lambda x, color=colors[vehicle_id % len(
+                        colors)]: {
                         'color': color, 'weight': 5, 'opacity': 0.7
                     },
                     tooltip=f"Vehicle {vehicle_id + 1}"
                 ).add_to(route_map)
+                st.markdown(f"**Vehicle {vehicle_id + 1}:**")
+                st.write(" → ".join(route_display) + " → 🏭 DEPOT")
+                st.write(f"Distance: {route_distance / 1000:.1f} km")
+                total_distance += route_distance
+                for i, label in enumerate(route_display):
+                    coord_row = selected_df[selected_df['Label'] == label]
+                    if not coord_row.empty:
+                        coord = (coord_row['Latitude'].iloc[0],
+                                 coord_row['Longitude'].iloc[0])
+                        folium.Marker(
+                            location=coord,
+                            popup=f"Vehicle {vehicle_id + 1} - {label}",
+                            icon=folium.Icon(
+                                color=colors[vehicle_id % len(colors)])
+                        ).add_to(marker_cluster)
 
-            # Display route info
-            st.markdown(f"**Vehicle {vehicle_id + 1}:**")
-            st.write(" → ".join(route_display) + " → 🏭 DEPOT")
-            st.write(f"Distance: {route_distance / 1000:.1f} km")
-            total_distance += route_distance
-
-            # Add markers
-            for i, label in enumerate(route_display):
-                coord_row = selected_df[selected_df['Label'] == label]
-                if not coord_row.empty:
-                    coord = (coord_row['Latitude'].iloc[0],
-                             coord_row['Longitude'].iloc[0])
-                    folium.Marker(
-                        location=coord,
-                        popup=f"Vehicle {vehicle_id + 1} - {label}",
-                        icon=folium.Icon(
-                            color=colors[vehicle_id % len(colors)])
-                    ).add_to(marker_cluster)
-
-        st.metric("Total Fleet Distance", f"{total_distance / 1000:.1f} km")
-
-        # Add depot marker
+        st.session_state.route_data = new_route_data
+        if total_distance > 0:
+            st.metric("Total Fleet Distance",
+                      f"{total_distance / 1000:.1f} km")
         folium.Marker(
             location=[selected_df.iloc[0]["Latitude"],
                       selected_df.iloc[0]["Longitude"]],
             popup="🏭 DEPOT",
             icon=folium.Icon(color="gray", icon="home")
         ).add_to(route_map)
-
         st_folium(route_map, width=900, height=500)
-
     else:
         st.error("❌ Could not generate optimal route.")
-        st.info(f"""
-        **Debugging Info:**
-        - Selected destinations: {len(selected_destinations)}
-        - Total locations: {len(matrix_coords)}
-        - Number of vehicles: {num_vehicles}
-        
-        **Suggestions:**
-        - Try reducing the number of vehicles
-        - Ensure API keys are configured correctly
-        - Check that all locations are accessible by road
-        """)
-
-        # Still show a simple map with selected locations
-        simple_map = folium.Map(
-            location=[selected_df.iloc[0]["Latitude"],
-                      selected_df.iloc[0]["Longitude"]],
-            zoom_start=9)
-
-        for idx, row in selected_df.iterrows():
-            folium.Marker(
-                location=[row["Latitude"], row["Longitude"]],
-                popup=row["Label"],
-                icon=folium.Icon(color="red" if idx == 0 else "blue")
-            ).add_to(simple_map)
-
-        st.subheader("📍 Selected Locations")
-        st_folium(simple_map, width=900, height=500)
+        if "route_data" in st.session_state:
+            del st.session_state["route_data"]
 
 # --- Tab 2: Disaster Management ---
 with tab2:
     st.header("🚨 Disaster Management & Route Safety")
-
     disaster_tab1, disaster_tab2 = st.tabs(
         ["Route Hazard Analysis", "GeoTIFF Analysis"])
-
     with disaster_tab1:
         st.markdown(
             "Monitor real-time hazards and get alternative routing recommendations.")
-
         if "route_data" not in st.session_state or not st.session_state.route_data:
-            st.info("👆 Please generate a route in the Route Planner tab first.")
-        else:
-            col1, col2 = st.columns([2, 1])
-
-            with col2:
-                st.subheader("⚙️ Analysis Settings")
-                analysis_date = st.date_input(
-                    "Analysis date:",
-                    # Default to a date when we know there was flooding
-                    value=datetime.date(2019, 11, 14),
-                    help="Select the date for hazard analysis"
-                )
-
-                if st.button("🔍 Check Route Hazards", type="primary"):
-                    with st.spinner("Analyzing routes for potential hazards..."):
-                        hazard_map = folium.Map(
-                            location=[53.5, -1.2], zoom_start=8)
-
-                        # Analyze each vehicle route
-                        total_affected_vehicles = 0
-
-                        for vehicle_id, route_info in st.session_state.route_data.items():
-                            route_coords = route_info["coords"]
-
-                            if len(route_coords) > 1:
-                                # Get directions for detailed route (cached)
-                                directions = get_directions(
-                                    tuple(route_coords))
-                                bbox = tuple(directions['bbox'])
-
-                                # Call Langflow for flood detection (cached)
-                                flood_overlay = get_flood_overlay_from_langflow_cached(
-                                    bbox, analysis_date.isoformat())
-
-                                # Add original route to map
-                                vehicle_num = int(vehicle_id.split('_')[1])
-                                colors = ["red", "blue",
-                                          "green", "purple", "orange"]
-                                color = colors[vehicle_num % len(colors)]
-
-                                folium.GeoJson(
-                                    directions,
-                                    style_function=lambda x, c=color: {
-                                        'color': c, 'weight': 4, 'opacity': 0.7},
-                                    tooltip=f"Vehicle {vehicle_num + 1} - Original Route"
-                                ).add_to(hazard_map)
-
-                                # Add flood overlay if detected
-                                if flood_overlay:
-                                    folium.GeoJson(
-                                        flood_overlay,
-                                        style_function=lambda x: {
-                                            'color': 'blue', 'fillColor': 'blue',
-                                            'fillOpacity': 0.5, 'weight': 2
-                                        },
-                                        name=f"Flood Risk - Vehicle {vehicle_num + 1}"
+            st.info(
+                "👆 Please generate a route with at least one destination in the Route Planner tab first.")
+            st.stop()
+        if 'run_hazard_analysis' not in st.session_state:
+            st.session_state.run_hazard_analysis = False
+        col1, col2 = st.columns([2, 1])
+        with col2:
+            st.subheader("⚙️ Analysis Settings")
+            analysis_date = st.date_input(
+                "Analysis date:",
+                value=datetime.date(2019, 11, 14),
+                help="Select the date for hazard analysis"
+            )
+            test_mode = st.checkbox(
+                "🧪 Test Mode (Simulate Flood Data)",
+                help="Enable this if Langflow API is not available",
+                key="test_mode_checkbox"
+            )
+            if st.button("🔍 Check Route Hazards", type="primary"):
+                st.session_state.run_hazard_analysis = True
+                st.session_state.analysis_test_mode = st.session_state.test_mode_checkbox
+                st.rerun()
+            if st.button("🗑️ Clear Analysis"):
+                for key in ["hazard_map", "total_affected_vehicles", "flood_data_found", "test_mode_used", "run_hazard_analysis", "analysis_test_mode"]:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
+        if st.session_state.get('run_hazard_analysis'):
+            with st.spinner("Analyzing routes for potential hazards..."):
+                hazard_map = folium.Map(location=[53.5, -1.2], zoom_start=8)
+                total_affected_vehicles = 0
+                flood_data_found = False
+                is_test_mode = st.session_state.get(
+                    'analysis_test_mode', False)
+                for vehicle_id, route_info in st.session_state.route_data.items():
+                    route_coords = route_info["coords"]
+                    if len(route_coords) > 1:
+                        directions = get_directions(tuple(route_coords))
+                        bbox = tuple(directions['bbox'])
+                        vehicle_num = int(vehicle_id.split('_')[1])
+                        colors = ["red", "blue", "green", "purple", "orange"]
+                        color = colors[vehicle_num % len(colors)]
+                        folium.GeoJson(
+                            directions,
+                            style_function=lambda x,
+                            c=color: {'color': c, 'weight': 4, 'opacity': 0.8},
+                            tooltip=f"Vehicle {vehicle_num + 1} - Original Route"
+                        ).add_to(hazard_map)
+                        for i, coord in enumerate(route_coords):
+                            folium.Marker(
+                                location=[coord[1], coord[0]],
+                                popup="🏭 DEPOT" if i == 0 else f"Vehicle {vehicle_num + 1} - Stop {i}",
+                                icon=folium.Icon(
+                                    color='gray' if i == 0 else color, icon='home' if i == 0 else 'truck')
+                            ).add_to(hazard_map)
+                        flood_overlay = None
+                        if is_test_mode:
+                            lincoln_area_route = any(
+                                53.1 <= c[1] <= 53.3 and -0.7 <= c[0] <= -0.3 for c in route_coords)
+                            if lincoln_area_route:
+                                flood_overlay = {
+                                    "type": "FeatureCollection", "features": [{"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [[[-0.6, 53.15], [-0.4, 53.15], [-0.4, 53.35], [-0.6, 53.35], [-0.6, 53.15]]]}, "properties": {"name": "Test Flood Zone - Lincoln Area", "severity": "high"}}]
+                                }
+                        else:
+                            flood_overlay = get_flood_overlay_from_langflow_cached(
+                                bbox, analysis_date.isoformat())
+                        if flood_overlay:
+                            flood_data_found = True
+                            folium.GeoJson(
+                                flood_overlay,
+                                style_function=lambda x: {
+                                    'color': 'blue', 'fillColor': 'blue', 'fillOpacity': 0.3, 'weight': 2},
+                                name=f"Flood Risk"
+                            ).add_to(hazard_map)
+                            affected_segments = analyze_road_flood_impact(
+                                route_coords, flood_overlay)
+                            if affected_segments:
+                                total_affected_vehicles += 1
+                                for segment in affected_segments:
+                                    folium.Marker(
+                                        location=[
+                                            segment["coordinate"][1], segment["coordinate"][0]],
+                                        popup=f"⚠️ HAZARD DETECTED",
+                                        icon=folium.Icon(
+                                            color='red', icon='exclamation-triangle', prefix='fa')
                                     ).add_to(hazard_map)
-
-                                    # Analyze impact
-                                    affected_segments = analyze_road_flood_impact(
-                                        route_coords, flood_overlay)
-
-                                    if affected_segments:
-                                        total_affected_vehicles += 1
-
-                                        # Add warning markers
-                                        for segment in affected_segments:
-                                            coord = segment["coordinate"]
-                                            folium.Marker(
-                                                location=[coord[1], coord[0]],
-                                                popup=f"⚠️ HAZARD DETECTED<br>Vehicle {vehicle_num + 1}<br>Flood Risk Area",
-                                                icon=folium.Icon(
-                                                    color='red', icon='exclamation-triangle', prefix='fa')
-                                            ).add_to(hazard_map)
-
-                        folium.LayerControl().add_to(hazard_map)
-
-                        # Store map in session state so it persists
-                        st.session_state.hazard_map = hazard_map
-                        st.session_state.total_affected_vehicles = total_affected_vehicles
-
-                # Add clear button
-                if "hazard_map" in st.session_state:
-                    if st.button("🗑️ Clear Analysis"):
-                        if "hazard_map" in st.session_state:
-                            del st.session_state.hazard_map
-                        if "total_affected_vehicles" in st.session_state:
-                            del st.session_state.total_affected_vehicles
-                        st.rerun()
-
-                # Display results outside the button handler
-                if "total_affected_vehicles" in st.session_state:
-                    if st.session_state.total_affected_vehicles > 0:
-                        st.error(
-                            f"⚠️ {st.session_state.total_affected_vehicles} vehicle route(s) affected by hazards!")
-
-                        st.subheader("🚨 Immediate Actions Required")
-                        st.markdown("""
-                        **High Priority:**
-                        - 🛑 **STOP** affected vehicles immediately
-                        - 📞 Contact drivers on affected routes
-                        - 🗺️ Generate alternative routes below
-                        
-                        **Next Steps:**
-                        - ⏱️ Expect 30-60 minute delays
-                        - 💰 Additional fuel costs for longer routes
-                        - 📱 Update customers with new ETAs
-                        """)
-
-                        if st.button("🔄 Generate Alternative Routes"):
-                            st.success(
-                                "✅ Alternative routes generated! Check with fleet manager for approval.")
-                    else:
-                        st.success(
-                            "✅ All routes clear - no hazards detected")
-                        st.info("Safe to proceed with planned routes")
-
-            with col1:
-                if "hazard_map" in st.session_state:
-                    st.subheader("🗺️ Route Hazard Analysis")
-                    st_folium(st.session_state.hazard_map,
-                              width=600, height=500)
+                folium.LayerControl().add_to(hazard_map)
+                st.session_state.hazard_map = hazard_map
+                st.session_state.total_affected_vehicles = total_affected_vehicles
+                st.session_state.flood_data_found = flood_data_found
+                st.session_state.test_mode_used = is_test_mode
+        with col2:
+            if "total_affected_vehicles" in st.session_state:
+                if st.session_state.get("test_mode_used", False):
+                    st.info(
+                        "🧪 **Test Mode Results** - Using simulated flood data.")
+                if st.session_state.total_affected_vehicles > 0:
+                    st.error(
+                        f"⚠️ {st.session_state.total_affected_vehicles} vehicle route(s) affected by hazards!")
+                    st.subheader("🚨 Immediate Actions Required")
+                    st.markdown(
+                        "- 🛑 **STOP** affected vehicles\n- 📞 Contact drivers\n- 🗺️ Generate alternative routes")
+                    if st.button("🔄 Generate Alternative Routes"):
+                        st.success("✅ Alternative routes generated!")
                 else:
-                    st.info("Click 'Check Route Hazards' to see analysis results")
-
+                    if st.session_state.get("flood_data_found") or st.session_state.get("test_mode_used"):
+                        st.success(
+                            "✅ All routes clear - no hazards detected.")
+                    else:
+                        st.warning(
+                            "⚠️ Could not verify route safety. No flood data available.")
+                        st.info(
+                            "Check Langflow API connection and data availability for the selected date.")
+        with col1:
+            st.subheader("🗺️ Route Hazard Analysis Map")
+            if "hazard_map" in st.session_state:
+                st_folium(st.session_state.hazard_map, width=800, height=600)
+            else:
+                st.info(
+                    "Click 'Check Route Hazards' on the right to view the analysis map.")
     with disaster_tab2:
         st.markdown(
             "Upload a GeoTIFF file to analyze flood impact on road networks.")
-
         uploaded_file = st.file_uploader(
             "Upload a GeoTIFF file (.tif, .tiff)", type=["tif", "tiff"], key="disaster_upload")
-
         if uploaded_file is not None:
             with st.spinner('Processing GeoTIFF and analyzing road impact...'):
                 try:
@@ -526,7 +469,6 @@ with tab2:
                         dst_crs = 'EPSG:3857'
                         transform, width, height = calculate_default_transform(
                             src.crs, dst_crs, src.width, src.height, *src.bounds)
-
                         reprojected_data = np.empty(
                             (1, height, width), dtype=src.dtypes[0])
                         reproject(
@@ -537,38 +479,31 @@ with tab2:
                             dst_transform=transform,
                             dst_crs=dst_crs,
                             resampling=Resampling.nearest)
-
                         dst_bounds = rasterio.transform.array_bounds(
                             height, width, transform)
                         wgs84_bounds = rasterio.warp.transform_bounds(
                             dst_crs, 'EPSG:4326', *dst_bounds)
                         west, south, east, north = wgs84_bounds
-
                         map_center_lat = (south + north) / 2
                         map_center_lon = (west + east) / 2
-
                         m = folium.Map(
                             location=[map_center_lat, map_center_lon], zoom_start=13)
-
                         overlay_image = np.zeros(
                             (height, width, 4), dtype=np.uint8)
                         overlay_image[reprojected_data[0] == 1] = [
                             0, 100, 255, 150]
-
                         folium.raster_layers.ImageOverlay(
                             image=overlay_image,
                             bounds=[[south, west], [north, east]],
                             opacity=0.7,
                             name="Floodwater"
                         ).add_to(m)
-
                         road_data_overpass = get_road_data(
                             south, west, north, east)
                         road_data_geojson = overpass_to_geojson(
                             road_data_overpass)
                         affected_roads, near_flood_roads = analyze_road_impact(
                             road_data_geojson, reprojected_data[0], transform, dst_crs, 'EPSG:4326')
-
                         affected_road_ids = {f['properties']['id']
                                              for f in affected_roads}
                         near_flood_road_ids = {f['properties']['id']
@@ -582,7 +517,6 @@ with tab2:
                                 return {'color': 'orange', 'weight': 4, 'opacity': 0.8}
                             else:
                                 return {'color': 'gray', 'weight': 2, 'opacity': 0.7}
-
                         if road_data_geojson['features']:
                             folium.GeoJson(
                                 road_data_geojson,
@@ -591,16 +525,11 @@ with tab2:
                                 tooltip=folium.GeoJsonTooltip(
                                     fields=['name', 'highway'], aliases=['Name:', 'Type:'])
                             ).add_to(m)
-
                         folium.LayerControl().add_to(m)
-
                     st.success("Analysis complete!")
-
                     map_col, results_col = st.columns([2, 1])
-
                     with map_col:
                         st_folium(m, width=700, height=500)
-
                     with results_col:
                         st.subheader("Analysis Results")
                         st.error(
@@ -611,10 +540,10 @@ with tab2:
                             f"**{len(near_flood_roads)} Roads Near Flooding**")
                         st.write(list(
                             set([r['properties'].get('name', 'Unnamed Road') for r in near_flood_roads])))
-
                 except Exception as e:
                     st.error(f"An error occurred: {e}")
                     st.exception(e)
+
 
 # --- Tab 3: Driver Dashboard ---
 with tab3:
@@ -634,7 +563,6 @@ with tab3:
         {"Driver": "Mike Brown", "Vehicle": "YX21 GHI",
             "Route": "Sheffield → Rotherham", "Status": "Hazard Alert", "ETA": "Delayed"},
     ]
-
     assignments_df = pd.DataFrame(assignments)
 
     def style_status(val):
@@ -646,6 +574,7 @@ with tab3:
             return "background-color: lightgreen"
         return ""
 
+    # FIX: Use .applymap() for element-wise styling, which is what style_status expects.
     styled_assignments = assignments_df.style.applymap(
         style_status, subset=['Status'])
     st.dataframe(styled_assignments, use_container_width=True)
@@ -654,22 +583,27 @@ with tab3:
     st.markdown(
         "Ask questions about weather, traffic conditions, or general FAQs")
 
-    FLOW_URL = f"http://localhost:7860/api/v1/run/customer-support2"
+    # NOTE: Ensure this URL points to your correct chat-oriented Langflow flow
+    FLOW_URL = "http://localhost:7860/api/v1/run/c496e528-0a6d-4be4-a4a7-f569309e1914"
     TWEAKS = {}
 
     def run_flow(message, output_type="chat", input_type="chat", tweaks=None):
         payload = {"input_value": message,
                    "output_type": output_type, "input_type": input_type}
-        headers = {"Content-Type": "application/json"}
+        if tweaks:
+            payload["tweaks"] = tweaks
+        headers = {"Content-Type": "application/json",
+                   "x-api-key": st.secrets.get("LANGFLOW_API_KEY", "")}
         try:
-            response = requests.request(
-                "POST", FLOW_URL, json=payload, headers=headers)
+            response = requests.post(FLOW_URL, json=payload, headers=headers)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            raise Exception(f"Error making API request: {e}")
+            st.error(f"Error making API request: {e}")
+            return None
         except ValueError as e:
-            raise Exception(f"Error parsing response: {e}")
+            st.error(f"Error parsing response: {e}")
+            return None
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -682,23 +616,24 @@ with tab3:
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
-
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
-            try:
+            with st.spinner("Thinking..."):
                 response = run_flow(
                     message=prompt, output_type="chat", input_type="chat", tweaks=TWEAKS)
-                result = response.get('outputs', [{}])[0].get('outputs', [{}])[0].get('results', {}).get(
-                    'message', {}).get('text', "I apologize, but I couldn't process your request. Please try again.")
-                message_placeholder.markdown(result)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": result})
-            except Exception as e:
-                error_message = f"I apologize, but I encountered an error: {str(e)}"
-                message_placeholder.markdown(error_message)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": error_message})
-
+                if response:
+                    try:
+                        result = response['outputs'][0]['outputs'][0]['results']['message']['text']
+                    except (KeyError, IndexError):
+                        result = "I apologize, but I couldn't process your request. Please try again."
+                    message_placeholder.markdown(result)
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": result})
+                else:
+                    error_message = "I'm having trouble connecting right now. Please try again later."
+                    message_placeholder.markdown(error_message)
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": error_message})
     if st.button("Clear Chat History"):
         st.session_state.messages = []
         st.rerun()
@@ -714,8 +649,6 @@ with tab4:
     col4.metric("Route Efficiency", "94%", delta="+2%")
 
     st.subheader("📊 Performance Metrics")
-
-    # Sample performance data
     performance_data = [
         {"Vehicle": "NK67 ABC", "Driver": "John Smith",
             "Deliveries": 8, "Distance": "156 km", "Fuel": "18.2L"},
@@ -724,21 +657,15 @@ with tab4:
         {"Vehicle": "YX21 GHI", "Driver": "Mike Brown",
             "Deliveries": 6, "Distance": "98 km", "Fuel": "14.7L"},
     ]
-
     performance_df = pd.DataFrame(performance_data)
     st.dataframe(performance_df, use_container_width=True)
 
     st.subheader("🌍 Service Area Coverage")
-
-    # Simple coverage map
     coverage_map = folium.Map(location=[53.5, -1.2], zoom_start=8)
-
-    # Add all logistics locations
-    for _, location in pd.DataFrame(LOGISTICS_LOCATIONS, columns=["Type", "Location", "Lat", "Lon"]).iterrows():
+    for _, location in df_locations.iterrows():
         folium.Marker(
-            location=[location["Lat"], location["Lon"]],
+            location=[location["Latitude"], location["Longitude"]],
             popup=f"{location['Type']}<br>{location['Location']}",
             icon=folium.Icon(color='blue', icon='truck', prefix='fa')
         ).add_to(coverage_map)
-
     st_folium(coverage_map, width=900, height=400)
