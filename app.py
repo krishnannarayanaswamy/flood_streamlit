@@ -11,7 +11,10 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 import io
 from streamlit_folium import st_folium
 import pyproj
+import datetime
+import json
 from disaster_management import get_road_data, overpass_to_geojson, analyze_road_impact
+from route_analysis import get_distance_matrix, get_directions, get_flood_overlay_from_langflow
 
 # Main app
 st.set_page_config(page_title="Logistics Buddy", page_icon="🚚", layout="wide")
@@ -108,12 +111,12 @@ with tab3:
                     folium.LayerControl().add_to(m)
 
                 st.success("Analysis complete!")
-                
+
                 map_col, results_col = st.columns([2, 1])
 
                 with map_col:
                     st_folium(m, width=700, height=500)
-                
+
                 with results_col:
                     st.subheader("Analysis Results")
                     st.error(
@@ -152,7 +155,7 @@ with tab1:
         - Recommendation for the best clothing
         - General FAQs
         """)
-        
+
     FLOW_URL = f"http://localhost:7860/api/v1/run/customer-support2"
     TWEAKS = {}
 
@@ -169,7 +172,7 @@ with tab1:
             raise Exception(f"Error making API request: {e}")
         except ValueError as e:
             raise Exception(f"Error parsing response: {e}")
-            
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
@@ -204,24 +207,7 @@ with tab1:
 
 # --- Tab 2: Route Planner Agent ---
 with tab2:
-    # --- Caching Functions for API Calls ---
-    @st.cache_data
-    def get_distance_matrix(coords):
-        client = openrouteservice.Client(key=st.secrets["ORS_API_KEY"])
-        matrix = client.distance_matrix(
-            locations=coords, profile='driving-car', metrics=['distance'], units='km')
-        return (np.array(matrix["distances"]) * 1000).astype(int)
-
-    @st.cache_data
-    def get_directions(route_coords):
-        client = openrouteservice.Client(key=st.secrets["ORS_API_KEY"])
-        return client.directions(
-            coordinates=route_coords,
-            profile='driving-car',
-            format='geojson'
-        )
-
-    st.subheader("Step 1: Select number of vehicles")
+    st.subheader("Step 1: Plan Your Route")
     num_vehicles = st.number_input(
         "How many vehicles will be used for delivery?", min_value=1, max_value=10, value=2, step=1)
 
@@ -231,15 +217,13 @@ with tab2:
                               "Brand", "District", "Latitude", "Longitude"])
     df_markets["Label"] = df_markets["Brand"] + " - " + df_markets["District"]
 
-    st.subheader("Step 2: Select depot location")
     depot_label = st.selectbox(
         "Choose the depot location (starting and ending point):", options=df_markets["Label"].unique())
 
-    st.subheader("Step 3: Select delivery markets")
     st.markdown(
         "Tick the boxes for the delivery points you want to include in the route:")
     sorted_market_labels = sorted(df_markets["Label"].unique())
-    
+
     selected_market_labels = []
     cols = st.columns(3)
     for i, label in enumerate(sorted_market_labels):
@@ -251,7 +235,8 @@ with tab2:
         delivery_locations.remove(depot_label)
 
     if not delivery_locations:
-        st.warning("Please select at least one delivery market that is not the depot.")
+        st.warning(
+            "Please select at least one delivery market that is not the depot.")
         st.stop()
 
     depot_df = df_markets[df_markets["Label"] == depot_label]
@@ -260,10 +245,9 @@ with tab2:
     selected_markets = pd.concat([depot_df, markets_df]).drop_duplicates(
         subset="Label").reset_index(drop=True)
     selected_markets.loc[0, "Label"] = "📦 DEPO"
-    
+
     matrix_coords = selected_markets[["Longitude", "Latitude"]].values.tolist()
-    
-    # Use the cached function to get the distance matrix
+
     distance_matrix = get_distance_matrix(tuple(map(tuple, matrix_coords)))
 
     data = {"distance_matrix": distance_matrix.tolist(
@@ -293,20 +277,20 @@ with tab2:
         routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
     solution = routing.SolveWithParameters(search_parameters)
 
-    st.subheader("Step 4: Optimized Routes")
+    st.subheader("Step 2: Review Route and Analyze for Floods")
     if solution:
-        total_distance = 0
         map_routes = folium.Map(location=[
                                 selected_markets.iloc[0]["Latitude"], selected_markets.iloc[0]["Longitude"]], zoom_start=11)
         colors = ["red", "blue", "green", "purple", "orange",
                   "darkred", "cadetblue", "darkgreen", "black", "pink"]
-        
+
         marker_cluster = MarkerCluster().add_to(map_routes)
+        total_distance = 0
 
         for vehicle_id in range(data["num_vehicles"]):
             index = routing.Start(vehicle_id)
             route_display, route_coords_for_api, route_distance = [], [], 0
-            
+
             while not routing.IsEnd(index):
                 node_index = manager.IndexToNode(index)
                 route_display.append(selected_markets.loc[node_index, "Label"])
@@ -315,12 +299,11 @@ with tab2:
                 index = solution.Value(routing.NextVar(index))
                 route_distance += routing.GetArcCostForVehicle(
                     previous_index, index, vehicle_id)
-            
+
             final_node_index = manager.IndexToNode(index)
             route_coords_for_api.append(tuple(matrix_coords[final_node_index]))
-            
+
             if len(route_coords_for_api) > 1:
-                # Use the cached function to get directions
                 directions = get_directions(tuple(route_coords_for_api))
                 folium.GeoJson(
                     directions,
@@ -336,22 +319,66 @@ with tab2:
             st.write(" → ".join(route_display) + " → 📦 DEPO")
             st.write(f"🛣️ Distance: {route_distance / 1000:.2f} km")
             total_distance += route_distance
-            
+
             for i, label in enumerate(route_display):
-                 coord = (selected_markets[selected_markets['Label'] == label]['Latitude'].iloc[0],
-                          selected_markets[selected_markets['Label'] == label]['Longitude'].iloc[0])
-                 folium.Marker(
-                     location=coord,
-                     popup=f"Vehicle {vehicle_id + 1} - Stop {i + 1}: {label}",
-                     icon=folium.Icon(color=colors[vehicle_id % len(colors)])
-                 ).add_to(marker_cluster)
+                coord = (selected_markets[selected_markets['Label'] == label]['Latitude'].iloc[0],
+                         selected_markets[selected_markets['Label'] == label]['Longitude'].iloc[0])
+                folium.Marker(
+                    location=coord,
+                    popup=f"Vehicle {vehicle_id + 1} - Stop {i + 1}: {label}",
+                    icon=folium.Icon(color=colors[vehicle_id % len(colors)])
+                ).add_to(marker_cluster)
 
         st.markdown(
             f"### 📦 Total distance for all vehicles: **{total_distance / 1000:.2f} km**")
         folium.Marker(location=[selected_markets.iloc[0]["Latitude"], selected_markets.iloc[0]["Longitude"]],
                       popup="📦 DEPO", icon=folium.Icon(color="gray", icon="home")).add_to(map_routes)
 
-        st.subheader("Step 5: Route Map")
-        st_folium(map_routes, width=900, height=600)
+        folium.LayerControl().add_to(map_routes)
+
+        # --- Flood Analysis UI ---
+        st.markdown("---")
+        st.subheader("Step 3: On-Demand Flood Analysis")
+
+        analysis_date = st.date_input(
+            "Select a date for analysis:", datetime.date.today())
+
+        if st.button("Analyze Route for Flooding"):
+            with st.spinner("Analyzing routes for potential flooding..."):
+                all_directions = []
+                for vehicle_id in range(data["num_vehicles"]):
+                    index = routing.Start(vehicle_id)
+                    route_coords_for_api = []
+                    while not routing.IsEnd(index):
+                        node_index = manager.IndexToNode(index)
+                        route_coords_for_api.append(
+                            tuple(matrix_coords[node_index]))
+                        index = solution.Value(routing.NextVar(index))
+                    final_node_index = manager.IndexToNode(index)
+                    route_coords_for_api.append(
+                        tuple(matrix_coords[final_node_index]))
+
+                    if len(route_coords_for_api) > 1:
+                        all_directions.append(get_directions(
+                            tuple(route_coords_for_api)))
+
+                for i, directions in enumerate(all_directions):
+                    bbox = tuple(directions['bbox'])
+
+                    flood_overlay_geojson = get_flood_overlay_from_langflow(
+                        bbox, analysis_date.isoformat())
+
+                    if flood_overlay_geojson:
+                        folium.GeoJson(
+                            flood_overlay_geojson,
+                            style_function=lambda x: {
+                                'color': 'blue', 'fillColor': 'blue', 'fillOpacity': 0.5, 'weight': 1},
+                            name=f"Flood Overlay Vehicle {i+1}"
+                        ).add_to(map_routes)
+
+                st.success(
+                    "Flood analysis complete. Check the map for flood overlays.")
+
+        st_folium(map_routes, width=900, height=600, key="route_map")
     else:
         st.error("❌ No solution found. Please try with different settings.")
