@@ -13,8 +13,8 @@ from streamlit_folium import st_folium
 import pyproj
 import datetime
 import json
-from disaster_management import get_road_data, overpass_to_geojson, analyze_road_impact
 import re
+from disaster_management import get_road_data, overpass_to_geojson, analyze_road_impact
 
 # Northern England logistics network
 LOGISTICS_LOCATIONS = [
@@ -70,8 +70,7 @@ def get_directions(route_coords):
 @st.cache_data
 def get_flood_overlay_from_langflow_cached(bbox, analysis_date):
     """
-    Cached version of Langflow flood detection API call.
-    This version now downloads and processes a GeoTIFF from a URL.
+    Cached version of Langflow flood detection API call for a single tile.
     """
     url = "http://localhost:7860/api/v1/run/c496e528-0a6d-4be4-a4a7-f569309e1914"
     api_key = st.secrets.get("LANGFLOW_API_KEY", "")
@@ -83,43 +82,33 @@ def get_flood_overlay_from_langflow_cached(bbox, analysis_date):
     }
 
     try:
-        # Get response from Langflow
-        api_response = requests.post(url, headers=headers, json=payload)
+        api_response = requests.post(
+            url, headers=headers, json=payload, timeout=60)
         api_response.raise_for_status()
         response_data = api_response.json()
 
-        # Extract the text message from the complex response structure
         message_text = response_data.get('outputs', [{}])[0].get('outputs', [{}])[
             0].get('results', {}).get('message', {}).get('text')
 
         if not message_text:
-            st.warning("Langflow did not return a message.")
             return None
 
-        # FIX: Use a regular expression for robust URL extraction
         url_match = re.search(r'https?://[^\s)]+', message_text)
         if not url_match:
-            st.warning(f"Could not extract a valid URL from Langflow message: '{message_text}'")
             return None
-            
+
         image_url = url_match.group(0)
 
-        st.info(f"Downloading flood overlay from: {image_url}")
         image_response = requests.get(image_url)
         image_response.raise_for_status()
         image_bytes = image_response.content
 
-        # Process the downloaded GeoTIFF image
         with rasterio.open(io.BytesIO(image_bytes)) as src:
             pixels = src.read(1)
-
-            # Create a transparent RGBA image for the overlay
             overlay_image = np.zeros(
                 (src.height, src.width, 4), dtype=np.uint8)
-            # Blue for flood, semi-transparent
             overlay_image[pixels == 1] = [0, 100, 255, 150]
 
-            # Get image bounds and convert to WGS84 for Folium
             wgs84_bounds = transform_bounds(src.crs, 'EPSG:4326', *src.bounds)
             west, south, east, north = wgs84_bounds
             folium_bounds = [[south, west], [north, east]]
@@ -132,54 +121,73 @@ def get_flood_overlay_from_langflow_cached(bbox, analysis_date):
                 "crs": src.crs
             }
 
-    except requests.exceptions.HTTPError as http_err:
-        st.error(f"HTTP error occurred: {http_err}")
+    except requests.exceptions.RequestException as e:
+        # Silently fail for a single tile, but log it.
+        print(f"Failed to process tile {bbox}: {e}")
         return None
     except Exception as e:
-        st.error(
-            f"An unexpected error occurred during flood data processing: {e}")
+        print(
+            f"An error occurred during flood data processing for tile {bbox}: {e}")
         return None
 
-# REWRITTEN function to work with raster data
+# --- NEW TILING AND ANALYSIS FUNCTIONS ---
 
 
-def analyze_road_flood_impact(route_coords, flood_raster_data):
-    """Analyzes if route coordinates intersect with flooded pixels in a raster."""
-    if not flood_raster_data:
+def generate_tiles(bbox, tile_size_deg=0.05):
+    """Generates a grid of smaller bounding boxes (tiles) to cover a larger one."""
+    min_lon, min_lat, max_lon, max_lat = bbox
+    tiles = []
+    lon_steps = np.arange(min_lon, max_lon, tile_size_deg)
+    lat_steps = np.arange(min_lat, max_lat, tile_size_deg)
+
+    for lon in lon_steps:
+        for lat in lat_steps:
+            tile_bbox = (lon, lat, lon + tile_size_deg, lat + tile_size_deg)
+            tiles.append(tile_bbox)
+    return tiles
+
+
+def analyze_road_flood_impact(route_coords, list_of_flood_rasters):
+    """Analyzes if route coordinates intersect with flooded pixels in a list of rasters."""
+    if not list_of_flood_rasters:
         return []
 
     affected_segments = []
-    pixels = flood_raster_data['pixels']
-    img_transform = flood_raster_data['transform']
-    img_crs = flood_raster_data['crs']
-
-    # Create a transformer to convert route coordinates (WGS84) to the image's CRS
-    transformer = pyproj.Transformer.from_crs(
-        'EPSG:4326', img_crs, always_xy=True)
 
     for i, coord in enumerate(route_coords):
-        try:
-            # Transform coordinate
-            lon_proj, lat_proj = transformer.transform(coord[0], coord[1])
+        lon, lat = coord[0], coord[1]
 
-            # Get pixel row and column
-            py, px = rasterio.transform.rowcol(
-                img_transform, lon_proj, lat_proj)
+        for raster_data in list_of_flood_rasters:
+            try:
+                # Lazily create and cache transformers
+                if f"transformer_{raster_data['crs']}" not in st.session_state:
+                    st.session_state[f"transformer_{raster_data['crs']}"] = pyproj.Transformer.from_crs(
+                        'EPSG:4326', raster_data['crs'], always_xy=True
+                    )
+                transformer = st.session_state[f"transformer_{raster_data['crs']}"]
 
-            # Check if pixel is within image bounds and if it's a flood pixel (value == 1)
-            if 0 <= py < pixels.shape[0] and 0 <= px < pixels.shape[1] and pixels[py, px] == 1:
-                affected_segments.append({"segment": i, "coordinate": coord})
+                # Check if coord is within the bounds of this tile before transforming
+                min_tile_lon, min_tile_lat = raster_data['bounds'][0][1], raster_data['bounds'][0][0]
+                max_tile_lon, max_tile_lat = raster_data['bounds'][1][1], raster_data['bounds'][1][0]
+                if not (min_tile_lon <= lon <= max_tile_lon and min_tile_lat <= lat <= max_tile_lat):
+                    continue
 
-        except Exception:
-            continue  # Ignore points that fall outside the transformation bounds
+                lon_proj, lat_proj = transformer.transform(lon, lat)
+                py, px = rasterio.transform.rowcol(
+                    raster_data['transform'], lon_proj, lat_proj)
+
+                pixels = raster_data['pixels']
+                if 0 <= py < pixels.shape[0] and 0 <= px < pixels.shape[1] and pixels[py, px] == 1:
+                    affected_segments.append(
+                        {"segment": i, "coordinate": coord})
+                    break  # Move to the next coordinate once a flood is found
+            except Exception:
+                continue
 
     return affected_segments
 
 
-# --- Main app ---
-# [The rest of the app code remains the same until Tab 2]
-
-# --- Main app ---
+# --- Main App ---
 st.set_page_config(page_title="Northern Express Logistics",
                    page_icon="🚚", layout="wide")
 
@@ -227,7 +235,6 @@ with tab1:
     if not selected_destinations:
         st.warning("Please select at least one delivery destination.")
         st.stop()
-
     # ... (Rest of Tab 1 logic is unchanged)
     if len(selected_destinations) == 1:
         st.info(
@@ -356,7 +363,6 @@ with tab1:
         if "route_data" in st.session_state:
             del st.session_state["route_data"]
 
-
 # --- Tab 2: Disaster Management (UPDATED LOGIC) ---
 with tab2:
     st.header("🚨 Disaster Management & Route Safety")
@@ -379,97 +385,87 @@ with tab2:
                 value=datetime.date(2019, 11, 14),
                 help="Select the date for hazard analysis"
             )
-            test_mode = st.checkbox(
-                "🧪 Test Mode (Simulate Flood Data)",
-                help="Enable this if Langflow API is not available",
-                key="test_mode_checkbox"
-            )
             if st.button("🔍 Check Route Hazards", type="primary"):
                 st.session_state.run_hazard_analysis = True
-                st.session_state.analysis_test_mode = st.session_state.test_mode_checkbox
                 st.rerun()
             if st.button("🗑️ Clear Analysis"):
-                for key in ["hazard_map", "total_affected_vehicles", "flood_data_found", "test_mode_used", "run_hazard_analysis", "analysis_test_mode"]:
+                for key in ["hazard_map", "total_affected_vehicles", "flood_data_found", "run_hazard_analysis"]:
                     if key in st.session_state:
                         del st.session_state[key]
                 st.rerun()
         if st.session_state.get('run_hazard_analysis'):
-            with st.spinner("Analyzing routes for potential hazards..."):
+            # This block now implements the tiling strategy
+            with st.spinner("Analyzing route areas for potential hazards..."):
                 hazard_map = folium.Map(location=[53.5, -1.2], zoom_start=8)
-                total_affected_vehicles = 0
-                flood_data_found = False
-                is_test_mode = st.session_state.get(
-                    'analysis_test_mode', False)
 
-                # Get flood data ONCE for the entire bounding box of all routes
+                # 1. Get overall bounding box and generate tiles
                 all_coords = [coord for route in st.session_state.route_data.values(
                 ) for coord in route['coords']]
-                if all_coords:
-                    min_lon = min(c[0] for c in all_coords)
-                    min_lat = min(c[1] for c in all_coords)
-                    max_lon = max(c[0] for c in all_coords)
-                    max_lat = max(c[1] for c in all_coords)
-                    overall_bbox = (min_lon, min_lat, max_lon, max_lat)
+                overall_bbox = (
+                    min(c[0] for c in all_coords), min(c[1]
+                                                       for c in all_coords),
+                    max(c[0] for c in all_coords), max(c[1]
+                                                       for c in all_coords)
+                )
+                tiles_to_process = generate_tiles(overall_bbox)
+                # TESTING HERE
+                if tiles_to_process:
+                    tiles_to_process = [tiles_to_process[0]]
 
-                    flood_data = get_flood_overlay_from_langflow_cached(
-                        overall_bbox, analysis_date.isoformat())
-
-                    if flood_data:
-                        flood_data_found = True
-                        # Add raster overlay to the map
+                # 2. Process each tile and collect the raster data
+                all_flood_rasters = []
+                progress_bar = st.progress(0, text="Analyzing map tiles...")
+                for i, tile_bbox in enumerate(tiles_to_process):
+                    tile_flood_data = get_flood_overlay_from_langflow_cached(
+                        tile_bbox, analysis_date.isoformat())
+                    if tile_flood_data:
+                        all_flood_rasters.append(tile_flood_data)
                         folium.raster_layers.ImageOverlay(
-                            image=flood_data['overlay_image'],
-                            bounds=flood_data['bounds'],
-                            opacity=0.7,
-                            name="Floodwater Overlay"
+                            image=tile_flood_data['overlay_image'],
+                            bounds=tile_flood_data['bounds'],
+                            opacity=0.6, name="Floodwater Overlay"
                         ).add_to(hazard_map)
+                    progress_bar.progress(
+                        (i + 1) / len(tiles_to_process), text=f"Analyzing map tiles... {i+1}/{len(tiles_to_process)}")
+                progress_bar.empty()
 
+                # 3. Analyze each route against the collected flood data
+                total_affected_vehicles = 0
                 for vehicle_id, route_info in st.session_state.route_data.items():
                     route_coords = route_info["coords"]
-                    if len(route_coords) > 1:
-                        # Draw route on map
-                        directions = get_directions(tuple(route_coords))
-                        vehicle_num = int(vehicle_id.split('_')[1])
-                        colors = ["red", "blue", "green", "purple", "orange"]
-                        color = colors[vehicle_num % len(colors)]
-                        folium.GeoJson(
-                            directions,
-                            style_function=lambda x, c=color: {
-                                'color': c, 'weight': 4, 'opacity': 0.8},
-                            tooltip=f"Vehicle {vehicle_num + 1} - Original Route"
-                        ).add_to(hazard_map)
+                    # Draw vehicle route on map
+                    directions = get_directions(tuple(route_coords))
+                    vehicle_num = int(vehicle_id.split('_')[1])
+                    colors = ["red", "blue", "green", "purple", "orange"]
+                    color = colors[vehicle_num % len(colors)]
+                    folium.GeoJson(
+                        directions,
+                        style_function=lambda x, c=color: {
+                            'color': c, 'weight': 4, 'opacity': 0.8},
+                        tooltip=f"Vehicle {vehicle_num + 1} - Original Route"
+                    ).add_to(hazard_map)
 
-                        # Add markers for route stops
-                        for i, coord in enumerate(route_coords):
+                    # Check for impact
+                    affected_segments = analyze_road_flood_impact(
+                        route_coords, all_flood_rasters)
+                    if affected_segments:
+                        total_affected_vehicles += 1
+                        # Add hazard markers
+                        for segment in affected_segments:
                             folium.Marker(
-                                location=[coord[1], coord[0]],
-                                popup="🏭 DEPOT" if i == 0 else f"Vehicle {vehicle_num + 1} - Stop {i}",
+                                location=[segment["coordinate"]
+                                          [1], segment["coordinate"][0]],
+                                popup=f"⚠️ HAZARD DETECTED on Route {vehicle_num+1}",
                                 icon=folium.Icon(
-                                    color='gray' if i == 0 else color, icon='home' if i == 0 else 'truck')
+                                    color='red', icon='exclamation-triangle', prefix='fa')
                             ).add_to(hazard_map)
-
-                        # Analyze impact if flood data is available
-                        if flood_data_found:
-                            affected_segments = analyze_road_flood_impact(
-                                route_coords, flood_data)
-                            if affected_segments:
-                                total_affected_vehicles += 1
-                                for segment in affected_segments:
-                                    folium.Marker(
-                                        location=[segment["coordinate"]
-                                                  [1], segment["coordinate"][0]],
-                                        popup=f"⚠️ HAZARD DETECTED",
-                                        icon=folium.Icon(
-                                            color='red', icon='exclamation-triangle', prefix='fa')
-                                    ).add_to(hazard_map)
 
                 folium.LayerControl().add_to(hazard_map)
                 st.session_state.hazard_map = hazard_map
                 st.session_state.total_affected_vehicles = total_affected_vehicles
-                st.session_state.flood_data_found = flood_data_found
-                st.session_state.test_mode_used = is_test_mode
+                st.session_state.flood_data_found = bool(all_flood_rasters)
 
-        # Display Results Area
+        # 4. Display results
         with col2:
             if "total_affected_vehicles" in st.session_state:
                 if st.session_state.total_affected_vehicles > 0:
@@ -485,7 +481,7 @@ with tab2:
                         st.success("✅ All routes clear - no hazards detected.")
                     else:
                         st.warning(
-                            "⚠️ Could not verify route safety. No flood data was returned.")
+                            "⚠️ Could not retrieve flood data. Proceed with caution.")
         with col1:
             st.subheader("🗺️ Route Hazard Analysis Map")
             if "hazard_map" in st.session_state:
@@ -494,7 +490,6 @@ with tab2:
                 st.info(
                     "Click 'Check Route Hazards' on the right to view the analysis map.")
 
-    # ... (Disaster Tab 2 for GeoTIFF upload remains unchanged)
     with disaster_tab2:
         st.markdown(
             "Upload a GeoTIFF file to analyze flood impact on road networks.")
