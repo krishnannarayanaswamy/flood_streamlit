@@ -30,9 +30,10 @@ def get_directions(route_coords):
 def get_flood_overlay_from_langflow(bbox, analysis_date):
     """
     Sends route coordinates and a single date to the Langflow endpoint.
+    Returns structured data for flood detection.
     """
     url = "http://localhost:7860/api/v1/run/c496e528-0a6d-4be4-a4a7-f569309e1914"
-    api_key = st.secrets["LANGFLOW_API_KEY"]
+    api_key = st.secrets.get("LANGFLOW_API_KEY", "")
 
     headers = {
         "x-api-key": api_key,
@@ -41,9 +42,8 @@ def get_flood_overlay_from_langflow(bbox, analysis_date):
 
     # Create the data structure as expected by your Langflow component
     input_data = {
-        # Convert bbox to comma-separated string
         "bounding_box": ",".join(map(str, bbox)),
-        "analysis_date": analysis_date  # Send the date as an ISO-formatted string
+        "analysis_date": analysis_date
     }
 
     # The input to your flow should be a JSON string of this data
@@ -56,22 +56,25 @@ def get_flood_overlay_from_langflow(bbox, analysis_date):
     }
 
     try:
-        st.info("Attempting to call Langflow endpoint...")
-        st.json(payload)  # Display the corrected payload being sent
+        st.write(f"🔍 Calling Langflow for tile: {bbox}")
 
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(url, headers=headers,
+                                 json=payload, timeout=60)
         response.raise_for_status()
 
-        st.success("Successfully received response from Langflow.")
-        st.json(response.json())  # Display the full response
+        st.write("✅ Received response from Langflow")
 
-        # You will likely need to parse the actual GeoJSON from the response text
         response_data = response.json()
         if 'outputs' in response_data and response_data['outputs']:
             # Navigate through the nested structure to get the final message text
             message_text = response_data['outputs'][0]['outputs'][0]['results']['message']['text']
-            # The text itself is a JSON string, so we need to parse it
-            return json.loads(message_text)
+
+            # Log what we received
+            st.write(f"📝 Response text: {message_text[:200]}...")
+
+            # The response should contain either a URL or JSON data
+            # Return the raw text for now - the flood_detection module will parse it
+            return message_text
         else:
             st.warning(
                 "Langflow response did not contain the expected output format.")
@@ -79,12 +82,10 @@ def get_flood_overlay_from_langflow(bbox, analysis_date):
 
     except requests.exceptions.HTTPError as http_err:
         st.error(f"HTTP error occurred: {http_err}")
-        st.error(f"Response content: {http_err.response.content.decode()}")
         return None
-    except json.JSONDecodeError as json_err:
-        st.error(f"Failed to parse JSON from Langflow response: {json_err}")
-        st.error(f"Raw response text: {response.text}")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Request error: {e}")
         return None
     except Exception as e:
-        st.error(f"An unexpected error occurred: {e}")
+        st.error(f"Unexpected error: {e}")
         return None
