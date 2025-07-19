@@ -42,10 +42,6 @@ def render(logistics_locations):
         if cols[i % 3].checkbox(label, key=f"dest_{label}"):
             selected_destinations.append(label)
 
-    # Quick selection for Doncaster testing
-    if depot_label == "Warehouse - Doncaster Logistics Park":
-        st.info("💡 For flood testing: Select 'Sainsbury's - Doncaster Lakeside' and 'Co-op Store - Rotherham Town Centre'")
-
     if not selected_destinations:
         st.warning("Please select at least one delivery destination.")
         return
