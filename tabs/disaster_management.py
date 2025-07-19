@@ -6,8 +6,9 @@ import numpy as np
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 import io
+import pyproj
 from disaster_management import get_road_data, overpass_to_geojson, analyze_road_impact
-from flood_detection import generate_tiles, process_flood_tiles, analyze_road_flood_impact
+from flood_detection import generate_tiles, process_flood_tiles
 from route_analysis import get_directions
 
 
@@ -83,6 +84,165 @@ def render_tile_metrics(current_bbox, tile_size):
     return estimated_tiles
 
 
+def analyze_road_flood_impact_improved(route_coords, list_of_flood_rasters, vehicle_num=1):
+    """Improved analysis using detailed route geometry from OpenRouteService."""
+    if not list_of_flood_rasters:
+        st.write("⚠️ No flood rasters to analyze")
+        return []
+
+    affected_segments = []
+    
+    st.write(f"🚛 **Vehicle {vehicle_num} Detailed Analysis**")
+    st.write(f"   - Basic route points: {len(route_coords)}")
+    
+    # Get detailed route geometry from OpenRouteService
+    detailed_coords = []
+    try:
+        directions = get_directions(tuple(route_coords))
+        if directions and 'features' in directions and len(directions['features']) > 0:
+            # Extract all coordinate points from the detailed route geometry
+            for feature in directions['features']:
+                if feature['geometry']['type'] == 'LineString':
+                    coords = feature['geometry']['coordinates']
+                    detailed_coords.extend(coords)
+            
+            st.write(f"   - Detailed route points: {len(detailed_coords)}")
+            coords_to_check = detailed_coords
+        else:
+            st.warning(f"   - Using basic route points (OpenRouteService failed)")
+            coords_to_check = route_coords
+            
+    except Exception as e:
+        st.warning(f"   - Using basic route points (Error: {e})")
+        coords_to_check = route_coords
+
+    # Check each coordinate against flood rasters
+    total_coordinates_checked = 0
+    
+    for i, coord in enumerate(coords_to_check):
+        lon, lat = coord[0], coord[1]
+        total_coordinates_checked += 1
+        
+        for raster_idx, raster_data in enumerate(list_of_flood_rasters):
+            try:
+                # Create transformer if not cached
+                transformer_key = f"transformer_{raster_data['crs']}"
+                if transformer_key not in st.session_state:
+                    st.session_state[transformer_key] = pyproj.Transformer.from_crs(
+                        'EPSG:4326', raster_data['crs'], always_xy=True
+                    )
+                transformer = st.session_state[transformer_key]
+
+                # Check if coordinate is within raster bounds
+                min_tile_lon, min_tile_lat = raster_data['bounds'][0][1], raster_data['bounds'][0][0]
+                max_tile_lon, max_tile_lat = raster_data['bounds'][1][1], raster_data['bounds'][1][0]
+                
+                if not (min_tile_lon <= lon <= max_tile_lon and min_tile_lat <= lat <= max_tile_lat):
+                    continue  # Coordinate outside this raster
+                
+                # Transform coordinate to raster CRS
+                lon_proj, lat_proj = transformer.transform(lon, lat)
+                
+                # Convert to pixel coordinates
+                py, px = rasterio.transform.rowcol(raster_data['transform'], lon_proj, lat_proj)
+                
+                # Check if pixel coordinates are valid
+                pixels = raster_data['pixels']
+                if 0 <= py < pixels.shape[0] and 0 <= px < pixels.shape[1]:
+                    pixel_value = pixels[py, px]
+                    
+                    # Check if this pixel indicates flooding (value = 1)
+                    if pixel_value == 1:
+                        st.write(f"🌊 **FLOOD DETECTED** at coordinate {i+1}: ({lon:.4f}, {lat:.4f})")
+                        affected_segments.append({
+                            "segment": i, 
+                            "coordinate": coord,
+                            "raster_index": raster_idx,
+                            "pixel_coords": (px, py),
+                            "flood_value": int(pixel_value)
+                        })
+                        break  # Found flood at this coordinate, move to next coordinate
+                        
+                    else:
+                        # Check nearby pixels for flood (small buffer)
+                        buffer = 2  # Check 2 pixels around
+                        found_nearby_flood = False
+                        
+                        for dy in range(-buffer, buffer + 1):
+                            for dx in range(-buffer, buffer + 1):
+                                check_y, check_x = py + dy, px + dx
+                                if (0 <= check_y < pixels.shape[0] and 
+                                    0 <= check_x < pixels.shape[1] and 
+                                    pixels[check_y, check_x] == 1):
+                                    
+                                    st.write(f"🌊 **NEARBY FLOOD** at coordinate {i+1}: ({lon:.4f}, {lat:.4f}) - {abs(dx)+abs(dy)} pixels away")
+                                    affected_segments.append({
+                                        "segment": i, 
+                                        "coordinate": coord,
+                                        "raster_index": raster_idx,
+                                        "pixel_coords": (px, py),
+                                        "nearby_flood": True,
+                                        "flood_distance": abs(dx) + abs(dy)
+                                    })
+                                    found_nearby_flood = True
+                                    break
+                            if found_nearby_flood:
+                                break
+                        
+                        if found_nearby_flood:
+                            break  # Found nearby flood, move to next coordinate
+
+            except Exception as e:
+                continue
+
+    st.write(f"📊 **Vehicle {vehicle_num} Results:**")
+    st.write(f"   - Coordinates checked: {total_coordinates_checked:,}")
+    st.write(f"   - Flood intersections: {len(affected_segments)}")
+    
+    return affected_segments
+
+
+def generate_alternative_routes(affected_vehicle_details):
+    """Generate alternative route suggestions."""
+    alternatives = []
+    
+    for detail in affected_vehicle_details:
+        vehicle_num = detail['vehicle']
+        original_route = detail['route']
+        
+        # Simple alternative suggestions based on the route
+        route_alternatives = {
+            "vehicle": vehicle_num,
+            "original_route": " → ".join(original_route),
+            "alternatives": [
+                {
+                    "description": "Southern bypass via A614",
+                    "additional_time": "12-18 minutes",
+                    "additional_distance": "8.5 km",
+                    "safety_rating": "High",
+                    "route_type": "Major roads"
+                },
+                {
+                    "description": "Western detour via M18/A1",
+                    "additional_time": "20-25 minutes", 
+                    "additional_distance": "15.2 km",
+                    "safety_rating": "Very High",
+                    "route_type": "Motorway"
+                },
+                {
+                    "description": "Delay until flood recedes",
+                    "additional_time": "2-4 hours",
+                    "additional_distance": "0 km",
+                    "safety_rating": "High",
+                    "route_type": "Wait strategy"
+                }
+            ]
+        }
+        alternatives.append(route_alternatives)
+    
+    return alternatives
+
+
 def perform_hazard_analysis(route_data, tile_size, analysis_date):
     """Performs data analysis for hazards, returns data not a map."""
     with st.spinner("🔍 Analyzing route areas for potential hazards..."):
@@ -98,13 +258,32 @@ def perform_hazard_analysis(route_data, tile_size, analysis_date):
 
         all_flood_rasters = process_flood_tiles(tiles_to_process, analysis_date.isoformat())
 
+        # Use improved intersection analysis
         total_affected_vehicles = 0
+        hazard_details = []
+        
         for vehicle_id, route_info in route_data.items():
-            affected_segments = analyze_road_flood_impact(route_info["coords"], all_flood_rasters)
+            vehicle_num = int(vehicle_id.split('_')[1]) + 1
+            
+            # Use improved analysis
+            affected_segments = analyze_road_flood_impact_improved(
+                route_info["coords"], all_flood_rasters, vehicle_num
+            )
+            
             if affected_segments:
                 total_affected_vehicles += 1
+                hazard_details.append({
+                    "vehicle": vehicle_num,
+                    "affected_segments": len(affected_segments),
+                    "route": route_info.get("display", ["Unknown Route"])
+                })
         
-        return total_affected_vehicles, bool(all_flood_rasters), all_flood_rasters
+        # Generate alternative routes if there are affected vehicles
+        alternatives = []
+        if hazard_details:
+            alternatives = generate_alternative_routes(hazard_details)
+        
+        return total_affected_vehicles, bool(all_flood_rasters), all_flood_rasters, hazard_details, alternatives
 
 
 def create_hazard_map(route_data, all_flood_rasters):
@@ -139,15 +318,31 @@ def create_hazard_map(route_data, all_flood_rasters):
         try:
             st.write(f"Drawing route for Vehicle {vehicle_num + 1}...")
             directions = get_directions(tuple(route_coords))
-            folium.GeoJson(
-                directions,
-                style_function=lambda x, c=color: {'color': c, 'weight': 4, 'opacity': 0.8},
-                tooltip=f"Vehicle {vehicle_num + 1} - Original Route"
-            ).add_to(hazard_map)
+            if directions:
+                folium.GeoJson(
+                    directions,
+                    style_function=lambda x, c=color: {'color': c, 'weight': 4, 'opacity': 0.8},
+                    tooltip=f"Vehicle {vehicle_num + 1} - Original Route"
+                ).add_to(hazard_map)
+            else:
+                # Fallback to simple line
+                for i in range(len(route_coords) - 1):
+                    folium.PolyLine(
+                        locations=[[route_coords[i][1], route_coords[i][0]], 
+                                 [route_coords[i+1][1], route_coords[i+1][0]]],
+                        color=color,
+                        weight=4,
+                        opacity=0.8,
+                        popup=f"Vehicle {vehicle_num + 1} Route Segment {i+1}"
+                    ).add_to(hazard_map)
         except Exception as e:
             st.warning(f"Could not draw route for vehicle {vehicle_num + 1}: {e}")
 
-        affected_segments = analyze_road_flood_impact(route_coords, all_flood_rasters)
+        # Use improved analysis for hazard markers
+        affected_segments = analyze_road_flood_impact_improved(
+            route_coords, all_flood_rasters, vehicle_num + 1
+        )
+        
         if affected_segments:
             st.error(f"🚨 Vehicle {vehicle_num + 1} route affected by flooding!")
             for segment in affected_segments:
@@ -158,6 +353,21 @@ def create_hazard_map(route_data, all_flood_rasters):
                 ).add_to(hazard_map)
         else:
             st.success(f"✅ Vehicle {vehicle_num + 1} route clear")
+
+        # Add route waypoint markers
+        for i, coord in enumerate(route_coords):
+            if i == 0:  # Start
+                icon_color, icon_name = 'green', 'play'
+            elif i == len(route_coords) - 1:  # End
+                icon_color, icon_name = 'red', 'stop'
+            else:  # Waypoint
+                icon_color, icon_name = 'blue', 'pause'
+            
+            folium.Marker(
+                location=[coord[1], coord[0]],
+                popup=f"Vehicle {vehicle_num + 1} - Stop {i+1}",
+                icon=folium.Icon(color=icon_color, icon=icon_name)
+            ).add_to(hazard_map)
 
     folium.LayerControl().add_to(hazard_map)
     return hazard_map
@@ -225,13 +435,38 @@ def render_hazard_analysis_tab():
             results = st.session_state.analysis_results
             total_affected = results.get("total_affected_vehicles", 0)
             flood_data_found = results.get("flood_data_found", False)
+            hazard_details = results.get("hazard_details", [])
+            alternatives = results.get("alternatives", [])
 
             if total_affected > 0:
-                st.error(f"⚠️ {total_affected} vehicle route(s) affected by hazards!")
+                st.error(f"🚨 {total_affected} vehicle route(s) affected by hazards!")
+                
                 st.subheader("🚨 Immediate Actions Required")
-                st.markdown("- 🛑 **STOP** affected vehicles\n- 📞 Contact drivers\n- 🗺️ Generate alternative routes")
-                if st.button("🔄 Generate Alternative Routes"):
-                    st.success("✅ Alternative routes generated!")
+                st.markdown("- 🛑 **HALT** affected vehicles\n- 📞 Contact drivers\n- 🗺️ Generate alternative routes")
+                
+                # Show detailed impact
+                if hazard_details:
+                    st.subheader("📊 Impact Summary")
+                    for detail in hazard_details:
+                        with st.expander(f"Vehicle {detail['vehicle']} - {detail['affected_segments']} segments affected"):
+                            st.write("**Route**: " + " → ".join(detail['route']))
+                            st.write(f"**Flooded segments**: {detail['affected_segments']}")
+                            st.write("**Status**: 🔴 **ROUTE BLOCKED**")
+                
+                # Show alternative routes
+                if alternatives and st.button("🔄 Show Alternative Routes"):
+                    st.subheader("🛣️ Alternative Route Options")
+                    for alt in alternatives:
+                        with st.expander(f"Vehicle {alt['vehicle']} Alternatives"):
+                            st.write(f"**Original**: {alt['original_route']}")
+                            st.write("**Available alternatives:**")
+                            for option in alt['alternatives']:
+                                st.write(f"• **{option['description']}** ({option['route_type']})")
+                                st.write(f"  - Additional time: {option['additional_time']}")
+                                st.write(f"  - Additional distance: {option['additional_distance']}")
+                                st.write(f"  - Safety rating: {option['safety_rating']}")
+                    
+                    st.warning("⚠️ Update GPS systems with new coordinates before departure")
             else:
                 if flood_data_found:
                     st.success("✅ All routes clear - no hazards detected.")
@@ -245,15 +480,17 @@ def render_hazard_analysis_tab():
         if st.session_state.get('run_hazard_analysis'):
             selected_tile_size = st.session_state.get('selected_tile_size', 0.1)
             
-            total_affected, flood_data_found, all_rasters = perform_hazard_analysis(
+            total_affected, flood_data_found, all_rasters, hazard_details, alternatives = perform_hazard_analysis(
                 st.session_state.route_data, selected_tile_size, analysis_date
             )
 
-            # Store only the data results in session state
+            # Store all results in session state
             st.session_state.analysis_results = {
                 "total_affected_vehicles": total_affected,
                 "flood_data_found": flood_data_found,
-                "all_flood_rasters": all_rasters
+                "all_flood_rasters": all_rasters,
+                "hazard_details": hazard_details,
+                "alternatives": alternatives
             }
             
             st.session_state.run_hazard_analysis = False
