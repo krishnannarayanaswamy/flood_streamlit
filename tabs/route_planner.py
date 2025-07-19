@@ -120,6 +120,8 @@ def render(logistics_locations):
             location=[selected_df.iloc[0]["Latitude"],
                       selected_df.iloc[0]["Longitude"]],
             zoom_start=10)
+        
+        bounds = []
 
         colors = ["red", "blue", "green", "purple", "orange"]
         marker_cluster = MarkerCluster().add_to(route_map)
@@ -156,13 +158,14 @@ def render(logistics_locations):
                 # Get route geometry and add to map
                 try:
                     directions = get_directions(tuple(route_coords))
-                    folium.GeoJson(
+                    geojson = folium.GeoJson(
                         directions,
                         style_function=lambda x, color=colors[vehicle_id % len(colors)]: {
                             'color': color, 'weight': 5, 'opacity': 0.7
                         },
                         tooltip=f"Vehicle {vehicle_id + 1}"
                     ).add_to(route_map)
+                    bounds.extend(geojson.get_bounds())
                 except Exception as e:
                     st.warning(
                         f"Could not get route geometry for vehicle {vehicle_id + 1}: {e}")
@@ -201,6 +204,10 @@ def render(logistics_locations):
             popup="🏭 DEPOT",
             icon=folium.Icon(color="gray", icon="home")
         ).add_to(route_map)
+
+        # Fit map to bounds
+        if bounds:
+            route_map.fit_bounds(bounds)
 
         # Display map
         st_folium(route_map, width=900, height=500)

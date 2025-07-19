@@ -2,13 +2,7 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 import datetime
-import numpy as np
-import rasterio
-from rasterio.warp import calculate_default_transform, reproject, Resampling
-import io
-import pyproj
-import requests
-from disaster_management import get_road_data, overpass_to_geojson, analyze_road_impact
+from disaster_management import get_road_data, overpass_to_geojson
 from flood_detection import generate_tiles, process_flood_tiles
 from route_analysis import get_directions
 
@@ -296,16 +290,18 @@ def render_improved_hazard_analysis():
 
             # Create enhanced map
             hazard_map = folium.Map(location=[53.5, -1.2], zoom_start=9)
+            bounds = []
 
             # Add flood overlays
             if results["all_flood_rasters"]:
                 for flood_data in results["all_flood_rasters"]:
-                    folium.raster_layers.ImageOverlay(
+                    overlay = folium.raster_layers.ImageOverlay(
                         image=flood_data['overlay_image'],
                         bounds=flood_data['bounds'],
-                        opacity=0.6,
+                        opacity=0.8,
                         name="🌊 Flood Areas"
                     ).add_to(hazard_map)
+                    bounds.extend(overlay.get_bounds())
 
             # Add original route
             for vehicle_id, route_info in st.session_state.route_data.items():
@@ -314,16 +310,17 @@ def render_improved_hazard_analysis():
                 try:
                     directions = get_directions(tuple(route_coords))
                     if directions:
-                        folium.GeoJson(
+                        geojson = folium.GeoJson(
                             directions,
                             style_function=lambda x: {
                                 'color': 'red', 'weight': 4, 'opacity': 0.9},
                             tooltip="⚠️ Original Route (FLOODED)"
                         ).add_to(hazard_map)
+                        bounds.extend(geojson.get_bounds())
 
                         # Add alternative routes if flooding detected
                         if results["total_affected"] > 0:
-                            alternative_routes = create_alternative_route_visualizations(
+                            create_alternative_route_visualizations(
                                 route_coords, hazard_map)
                 except Exception as e:
                     st.warning(f"Could not display routes: {e}")
@@ -352,6 +349,9 @@ def render_improved_hazard_analysis():
                         popup=f"📍 {'Depot' if i == 0 else 'Destination'}",
                         icon=folium.Icon(color=icon_color, icon=icon_name)
                     ).add_to(hazard_map)
+
+            if bounds:
+                hazard_map.fit_bounds(bounds)
 
             folium.LayerControl().add_to(hazard_map)
             st_folium(hazard_map, width=800, height=500)
