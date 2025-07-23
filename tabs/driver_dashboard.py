@@ -43,15 +43,14 @@ def render():
     st.markdown(
         "Ask questions about weather, traffic conditions, or general FAQs")
 
-    FLOW_URL = "http://localhost:7860/api/v1/run/c496e528-0a6d-4be4-a4a7-f569309e1914"
+    FLOW_URL = "http://localhost:7860/api/v1/run/88df7948-8e1d-4db4-b97e-ce2626d174c3"
 
     def run_flow(message, output_type="chat", input_type="chat", tweaks=None):
         payload = {"input_value": message,
                    "output_type": output_type, "input_type": input_type}
         if tweaks:
             payload["tweaks"] = tweaks
-        headers = {"Content-Type": "application/json",
-                   "x-api-key": st.secrets.get("LANGFLOW_API_KEY", "")}
+        headers = {"Content-Type": "application/json"}
         try:
             response = requests.post(FLOW_URL, json=payload, headers=headers)
             response.raise_for_status()

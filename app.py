@@ -30,11 +30,10 @@ with col2:
 
 # Navigation tabs
 if MODULES_AVAILABLE:
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🤖 Support Agent",
-        "🗺️ Route Planner",
-        "🚨 Disaster Management",
+    tab1, tab2, tab3, tab4 = st.tabs([
         "👨‍💼 Driver Dashboard",
+        "🗺️ Route Planner",
+        "🚨 Disaster Management",    
         "📊 Fleet Overview"
     ])
 else:
@@ -47,104 +46,9 @@ else:
 
 # === TAB 1: SUPPORT AGENT ===
 with tab1:
-    st.header("🤖 AI Support Agent")
-    st.markdown("""
-    Welcome to our AI-powered support agent! I can help you with:
-    - 🌤️ Weather and traffic conditions
-    - 👔 Recommendations for optimal delivery times
-    - ❓ General logistics FAQs
-    - 🚛 Fleet management questions
-    """)
-
-    # Flow configuration
-    FLOW_URL = "http://localhost:7860/api/v1/run/customer-support2"
-
-    def run_flow(message, output_type="chat", input_type="chat", tweaks=None):
-        """Run the Langflow flow with the given message."""
-        payload = {
-            "input_value": message,
-            "output_type": output_type,
-            "input_type": input_type
-        }
-
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": st.secrets.get("LANGFLOW_API_KEY", "")
-        }
-
-        try:
-            response = requests.post(
-                FLOW_URL, json=payload, headers=headers, timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            st.error(f"Connection error: {e}")
-            return None
-        except ValueError as e:
-            st.error(f"Response parsing error: {e}")
-            return None
-
-    # Custom CSS for better chat styling
-    st.markdown("""
-        <style>
-        .stChatMessage {
-            padding: 1rem;
-            border-radius: 0.5rem;
-            margin-bottom: 1rem;
-        }
-        .stTextInput > div > div > input {
-            background-color: #f0f2f6;
-        }
-        </style>
-        """, unsafe_allow_html=True)
-
-    # Initialize session state for chat history
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    # Display chat history
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    # Chat input
-    if prompt := st.chat_input("How can I help you today?", key="support_agent_chat"):
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        # Display assistant response
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-
-            with st.spinner("Thinking..."):
-                try:
-                    response = run_flow(
-                        message=prompt, output_type="chat", input_type="chat")
-
-                    if response and 'outputs' in response:
-                        result = response['outputs'][0]['outputs'][0]['results']['message']['text']
-                    else:
-                        result = "I apologize, but I couldn't process your request. Please try again."
-
-                    message_placeholder.markdown(result)
-                    st.session_state.messages.append(
-                        {"role": "assistant", "content": result})
-
-                except Exception as e:
-                    error_msg = f"I apologize, but I encountered an error: {str(e)}"
-                    message_placeholder.markdown(error_msg)
-                    st.session_state.messages.append(
-                        {"role": "assistant", "content": error_msg})
-
-    # Clear chat button
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col2:
-        if st.button("🗑️ Clear Chat History", use_container_width=True):
-            st.session_state.messages = []
-            st.rerun()
-
+    if MODULES_AVAILABLE:
+        driver_dashboard.render()
+   
 # === TAB 2: ROUTE PLANNER ===
 with tab2:
     if MODULES_AVAILABLE:
@@ -257,9 +161,6 @@ with tab3:
 # === TAB 4: DRIVER DASHBOARD / FLEET OVERVIEW ===
 if MODULES_AVAILABLE:
     with tab4:
-        driver_dashboard.render()
-
-    with tab5:
         fleet_overview.render([
             ("Distribution Hub", "Leeds Central", 53.8008, -1.5491),
             ("Warehouse", "Doncaster Logistics Park", 53.5228, -1.1285),

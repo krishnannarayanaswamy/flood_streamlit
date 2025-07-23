@@ -189,7 +189,7 @@ def render_improved_hazard_analysis():
 
         analysis_date = st.date_input(
             "Analysis date:",
-            value=datetime.date(2019, 11, 14),
+            value=datetime.datetime(2019, 11, 14, 00, 00, 00),
             help="Select the date for flood analysis"
         )
 
@@ -253,7 +253,7 @@ def render_improved_hazard_analysis():
                 tiles_to_process = generate_tiles(
                     overall_bbox, selected_tile_size)
                 all_flood_rasters = process_flood_tiles(
-                    tiles_to_process, analysis_date.isoformat())
+                    tiles_to_process, analysis_date.strftime("%Y-%m-%d %H:%M:%S"))
 
                 # Analyze routes with improved method
                 from flood_detection import analyze_road_flood_impact_improved
@@ -392,7 +392,7 @@ def render_improved_hazard_analysis():
                 st.write("• Safety rating: Very High")
                 st.write("• Route type: Motorway")
 
-                if st.button("📱 Send Alerts to Drivers", type="primary"):
+                if st.button("📱 Send Alerts to Authorities", type="primary"):
                     st.success("✅ Safety alerts sent to all affected drivers!")
                     st.balloons()
 

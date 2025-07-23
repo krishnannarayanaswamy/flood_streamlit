@@ -28,10 +28,10 @@ def get_flood_overlay_from_langflow_cached(bbox, analysis_date):
     """
     Cached version of Langflow flood detection API call for a single tile.
     """
-    url = "http://localhost:7860/api/v1/run/c496e528-0a6d-4be4-a4a7-f569309e1914"
-    api_key = st.secrets.get("LANGFLOW_API_KEY", "")
+    url = "http://localhost:7860/api/v1/run/450bdd6d-1365-48dc-a819-779a0ccbf40c"
+    #api_key = st.secrets.get("LANGFLOW_API_KEY", "")
 
-    headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json"}
     payload = {
         "input_value": json.dumps({"bounding_box": ",".join(map(str, bbox)), "analysis_date": analysis_date}),
         "output_type": "chat",
